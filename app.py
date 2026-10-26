@@ -76,44 +76,102 @@ def _render_positions_table(positions: List[Position]) -> None:
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
-def _render_grouped_positions(portfolio: Portfolio) -> None:
+def _render_grouped_positions(
+    portfolio: Portfolio, filtered_positions: List[Position]
+) -> None:
     st.subheader("Grouped Positions")
     tab_expiry, tab_symbol = st.tabs(["By Expiry", "By Symbol"])
 
     with tab_expiry:
-        for expiry, positions in sorted(portfolio.group_by_expiry().items()):
+        groups = portfolio.group_by_expiry(filtered_positions)
+        for expiry, positions in sorted(groups.items()):
             with st.expander(f"{expiry.strftime('%d-%b-%Y')} ({len(positions)} legs)"):
                 _render_positions_table(positions)
 
     with tab_symbol:
-        for symbol, positions in sorted(portfolio.group_by_symbol().items()):
+        for symbol, positions in sorted(portfolio.group_by_symbol(filtered_positions).items()):
             with st.expander(f"{symbol} ({len(positions)} legs)"):
                 _render_positions_table(positions)
 
 
+def _build_curve(
+    payoff_engine: PayoffEngine, positions: List[Position], spot: float
+):
+    """
+    Payoff curve for a single underlying, with the simulated range scaled
+    to its spot price. The engine's default +/-2000 grid suits index
+    options but would run into negative prices for a ~300 stock.
+    """
+    spread = min(2000.0, spot * 0.25)
+    return payoff_engine.build_payoff_curve(
+        positions, current_spot=spot, spread=spread, step=spread / 40
+    )
+
+
+def _stat_labels(stats) -> dict:
+    """Display strings for the payoff-derived statistics."""
+    return {
+        "Max Profit": (
+            "Unbounded" if stats.is_max_profit_unbounded else f"{stats.max_profit:,.2f}"
+        ),
+        "Max Loss": (
+            "Unbounded" if stats.is_max_loss_unbounded else f"{stats.max_loss:,.2f}"
+        ),
+        "Risk-Reward Ratio": (
+            "N/A" if stats.risk_reward_ratio is None else f"{stats.risk_reward_ratio:.2f}"
+        ),
+        "Breakeven(s)": (
+            ", ".join(f"{b:,.2f}" for b in stats.breakevens)
+            if stats.breakevens
+            else "None found"
+        ),
+    }
+
+
 def _render_statistics(analytics: AnalyticsEngine, positions: List[Position], curve) -> None:
     stats = analytics.compute_statistics(positions, curve)
+    labels = _stat_labels(stats)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current MTM", f"{stats.current_mtm:,.2f}")
     col2.metric("Net Premium", f"{stats.net_premium:,.2f}")
-
-    max_profit_label = (
-        "Unbounded" if stats.is_max_profit_unbounded else f"{stats.max_profit:,.2f}"
-    )
-    max_loss_label = (
-        "Unbounded" if stats.is_max_loss_unbounded else f"{stats.max_loss:,.2f}"
-    )
-    col3.metric("Max Profit", max_profit_label)
-    col4.metric("Max Loss", max_loss_label)
+    col3.metric("Max Profit", labels["Max Profit"])
+    col4.metric("Max Loss", labels["Max Loss"])
 
     col5, col6 = st.columns(2)
-    rr_label = "N/A" if stats.risk_reward_ratio is None else f"{stats.risk_reward_ratio:.2f}"
-    col5.metric("Risk-Reward Ratio", rr_label)
-    breakeven_label = (
-        ", ".join(f"{b:,.2f}" for b in stats.breakevens) if stats.breakevens else "None found"
-    )
-    col6.metric("Breakeven(s)", breakeven_label)
+    col5.metric("Risk-Reward Ratio", labels["Risk-Reward Ratio"])
+    col6.metric("Breakeven(s)", labels["Breakeven(s)"])
+
+
+def _render_multi_underlying_statistics(
+    analytics: AnalyticsEngine, positions_by_symbol: dict, curves: dict
+) -> None:
+    """
+    Statistics for a book spanning several underlyings. MTM and net premium
+    add up across symbols, but expiry payoff only makes sense against one
+    underlying's price, so max profit/loss and breakevens are per symbol.
+    """
+    all_positions = [p for legs in positions_by_symbol.values() for p in legs]
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Current MTM", f"{analytics.current_mtm(all_positions):,.2f}")
+    col2.metric("Net Premium", f"{analytics.net_premium(all_positions):,.2f}")
+    col3.metric("Underlyings", len(positions_by_symbol))
+
+    st.subheader("Per-Underlying Statistics")
+    rows = []
+    for symbol, legs in positions_by_symbol.items():
+        stats = analytics.compute_statistics(legs, curves[symbol])
+        rows.append(
+            {
+                "Symbol": symbol,
+                "Spot": round(curves[symbol].current_spot, 2),
+                "Legs": len(legs),
+                "MTM": round(stats.current_mtm, 2),
+                "Net Premium": round(stats.net_premium, 2),
+                **_stat_labels(stats),
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 def main() -> None:
@@ -140,20 +198,35 @@ def main() -> None:
     payoff_engine = PayoffEngine()
     analytics = AnalyticsEngine(payoff_engine)
 
-    spot = portfolio.representative_spot(filtered_positions)
-    curve = payoff_engine.build_payoff_curve(filtered_positions, current_spot=spot)
+    positions_by_symbol = dict(
+        sorted(portfolio.group_by_symbol(filtered_positions).items())
+    )
+    curves = {
+        symbol: _build_curve(payoff_engine, legs, portfolio.representative_spot(legs))
+        for symbol, legs in positions_by_symbol.items()
+    }
 
     st.header("Portfolio Statistics")
-    _render_statistics(analytics, filtered_positions, curve)
-
-    st.header("Payoff Chart")
-    st.pyplot(charts.plot_payoff_chart(curve))
+    if len(positions_by_symbol) == 1:
+        (curve,) = curves.values()
+        _render_statistics(analytics, filtered_positions, curve)
+        st.header("Payoff Chart")
+        st.pyplot(charts.plot_payoff_chart(curve))
+    else:
+        _render_multi_underlying_statistics(analytics, positions_by_symbol, curves)
+        st.header("Payoff Chart")
+        chart_symbol = st.selectbox("Underlying", list(positions_by_symbol))
+        st.pyplot(
+            charts.plot_payoff_chart(
+                curves[chart_symbol], title=f"{chart_symbol} Payoff at Expiry"
+            )
+        )
 
     st.header("Current P&L by Position")
     st.pyplot(charts.plot_current_pnl_chart(filtered_positions))
 
     _render_positions_table(filtered_positions)
-    _render_grouped_positions(portfolio)
+    _render_grouped_positions(portfolio, filtered_positions)
 
 
 if __name__ == "__main__":

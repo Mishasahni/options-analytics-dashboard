@@ -55,17 +55,23 @@ class Portfolio:
 
     # -- grouping -------------------------------------------------------
 
-    def group_by_expiry(self) -> Dict[date, List[Position]]:
-        """Group open positions by expiry date."""
+    def group_by_expiry(
+        self, positions: Optional[Sequence[Position]] = None
+    ) -> Dict[date, List[Position]]:
+        """Group the given positions (defaults to all) by expiry date."""
+        target = positions if positions is not None else self._positions
         groups: Dict[date, List[Position]] = defaultdict(list)
-        for position in self._positions:
+        for position in target:
             groups[position.expiry].append(position)
         return dict(groups)
 
-    def group_by_symbol(self) -> Dict[str, List[Position]]:
-        """Group open positions by underlying symbol."""
+    def group_by_symbol(
+        self, positions: Optional[Sequence[Position]] = None
+    ) -> Dict[str, List[Position]]:
+        """Group the given positions (defaults to all) by underlying symbol."""
+        target = positions if positions is not None else self._positions
         groups: Dict[str, List[Position]] = defaultdict(list)
-        for position in self._positions:
+        for position in target:
             groups[position.symbol].append(position)
         return dict(groups)
 
